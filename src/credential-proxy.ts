@@ -104,6 +104,23 @@ export function startCredentialProxy(
           }
         });
 
+        // Handle client disconnect — abort upstream to prevent resource leaks
+        res.on('close', () => {
+          if (!res.writableEnded) {
+            upstream.destroy();
+          }
+        });
+
+        // Timeout upstream requests after 5 minutes to prevent indefinite hangs
+        upstream.setTimeout(300000, () => {
+          logger.error({ url: req.url }, 'Credential proxy upstream timeout');
+          upstream.destroy(new Error('Upstream timeout after 5 minutes'));
+          if (!res.headersSent) {
+            res.writeHead(504);
+            res.end('Gateway Timeout');
+          }
+        });
+
         upstream.write(body);
         upstream.end();
       });

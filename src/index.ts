@@ -222,8 +222,30 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+        // Retry sendMessage up to 3 times with backoff for transient failures
+        let lastErr: unknown;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            await channel.sendMessage(chatJid, text);
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            logger.warn(
+              { group: group.name, chatJid, attempt, err },
+              'Failed to send message, retrying',
+            );
+            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+          }
+        }
+        if (lastErr) {
+          logger.error(
+            { group: group.name, chatJid, err: lastErr },
+            'Failed to send message after 3 attempts',
+          );
+        } else {
+          outputSentToUser = true;
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();

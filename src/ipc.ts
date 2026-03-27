@@ -81,7 +81,13 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  const sendTimeout = new Promise<never>((_, reject) =>
+                    setTimeout(() => reject(new Error('IPC sendMessage timed out after 30s')), 30000),
+                  );
+                  await Promise.race([
+                    deps.sendMessage(data.chatJid, data.text),
+                    sendTimeout,
+                  ]);
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',

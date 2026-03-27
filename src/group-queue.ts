@@ -265,9 +265,15 @@ export class GroupQueue {
     if (state.retryCount > MAX_RETRIES) {
       logger.error(
         { groupJid, retryCount: state.retryCount },
-        'Max retries exceeded, dropping messages (will retry on next incoming message)',
+        'Max retries exceeded, will retry after cooldown',
       );
       state.retryCount = 0;
+      // Instead of dropping, schedule a delayed retry after a longer cooldown
+      setTimeout(() => {
+        if (!this.shuttingDown && state.pendingMessages) {
+          this.enqueueMessageCheck(groupJid);
+        }
+      }, 60000); // 1 minute cooldown before retrying
       return;
     }
 

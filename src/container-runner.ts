@@ -367,7 +367,12 @@ export async function runContainerAgent(
             resetTimeout();
             // Call onOutput for all markers (including null results)
             // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
+            outputChain = outputChain.then(() => onOutput(parsed)).catch((err) => {
+              logger.error(
+                { group: group.name, error: err },
+                'Error in onOutput callback, continuing chain',
+              );
+            });
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },
@@ -461,6 +466,12 @@ export async function runContainerAgent(
             'Container timed out after output (idle cleanup)',
           );
           outputChain.then(() => {
+            resolve({
+              status: 'success',
+              result: null,
+              newSessionId,
+            });
+          }).catch(() => {
             resolve({
               status: 'success',
               result: null,
@@ -578,6 +589,16 @@ export async function runContainerAgent(
           logger.info(
             { group: group.name, duration, newSessionId },
             'Container completed (streaming mode)',
+          );
+          resolve({
+            status: 'success',
+            result: null,
+            newSessionId,
+          });
+        }).catch((err) => {
+          logger.error(
+            { group: group.name, error: err },
+            'Error in output chain on close, resolving anyway',
           );
           resolve({
             status: 'success',

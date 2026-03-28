@@ -14,8 +14,10 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  SUBPROCESS_MODE,
   TIMEZONE,
 } from './config.js';
+import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -264,6 +266,140 @@ function buildContainerArgs(
   return args;
 }
 
+/**
+ * Ensure group directories exist and skills are synced.
+ * Used by both Docker and subprocess modes.
+ */
+function ensureGroupDirectories(group: RegisteredGroup, isMain: boolean): void {
+  const groupDir = resolveGroupFolderPath(group.folder);
+  fs.mkdirSync(groupDir, { recursive: true });
+
+  // Per-group Claude sessions directory
+  const groupSessionsDir = path.join(
+    DATA_DIR,
+    'sessions',
+    group.folder,
+    '.claude',
+  );
+  fs.mkdirSync(groupSessionsDir, { recursive: true });
+  const settingsFile = path.join(groupSessionsDir, 'settings.json');
+  if (!fs.existsSync(settingsFile)) {
+    fs.writeFileSync(
+      settingsFile,
+      JSON.stringify(
+        {
+          env: {
+            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+  }
+
+  // Sync skills
+  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  const skillsDst = path.join(groupSessionsDir, 'skills');
+  if (fs.existsSync(skillsSrc)) {
+    for (const skillDir of fs.readdirSync(skillsSrc)) {
+      const srcDir = path.join(skillsSrc, skillDir);
+      if (!fs.statSync(srcDir).isDirectory()) continue;
+      const dstDir = path.join(skillsDst, skillDir);
+      fs.cpSync(srcDir, dstDir, { recursive: true });
+    }
+  }
+
+  // Per-group IPC namespace
+  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+
+  // Copy agent-runner source for customization
+  const agentRunnerSrc = path.join(process.cwd(), 'container', 'agent-runner', 'src');
+  const groupAgentRunnerDir = path.join(
+    DATA_DIR,
+    'sessions',
+    group.folder,
+    'agent-runner-src',
+  );
+  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
+    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  }
+}
+
+/**
+ * Spawn the agent as a direct Node.js subprocess (no Docker).
+ * Used when SUBPROCESS_MODE=true (e.g. Railway, Render, or other PaaS).
+ */
+function spawnSubprocess(
+  group: RegisteredGroup,
+  input: ContainerInput,
+): { proc: ChildProcess; name: string } {
+  const projectRoot = process.cwd();
+  const groupDir = resolveGroupFolderPath(group.folder);
+  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  const groupSessionsDir = path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+  const groupAgentRunnerDir = path.join(DATA_DIR, 'sessions', group.folder, 'agent-runner-src');
+
+  // Read secrets from .env — subprocess can access them directly
+  const secrets = readEnvFile([
+    'ANTHROPIC_API_KEY',
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_AUTH_TOKEN',
+  ]);
+
+  // Build additional mount paths for extra dirs
+  const extraDirs: string[] = [];
+  if (group.containerConfig?.additionalMounts) {
+    for (const mount of group.containerConfig.additionalMounts) {
+      const hostPath = mount.hostPath.replace(/^~/, process.env.HOME || '');
+      if (fs.existsSync(hostPath)) {
+        extraDirs.push(hostPath);
+      }
+    }
+  }
+
+  const childEnv: Record<string, string | undefined> = {
+    ...process.env,
+    TZ: TIMEZONE,
+    // Direct API access — no credential proxy
+    ANTHROPIC_API_KEY: secrets.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY,
+    CLAUDE_CODE_OAUTH_TOKEN: secrets.CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_CODE_OAUTH_TOKEN,
+    ANTHROPIC_AUTH_TOKEN: secrets.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN,
+    // Remove proxy URL if set — subprocess talks to Anthropic directly
+    ANTHROPIC_BASE_URL: undefined,
+    // Path overrides for the agent-runner
+    NANOCLAW_WORKSPACE_GROUP: groupDir,
+    NANOCLAW_WORKSPACE_IPC: groupIpcDir,
+    NANOCLAW_WORKSPACE_GLOBAL: path.join(GROUPS_DIR, 'global'),
+    NANOCLAW_WORKSPACE_PROJECT: projectRoot,
+    NANOCLAW_WORKSPACE_EXTRA: extraDirs.length > 0 ? extraDirs.join(path.delimiter) : undefined,
+    NANOCLAW_AGENT_RUNNER_SRC: groupAgentRunnerDir,
+    // Point HOME to the sessions dir so the SDK finds .claude/settings.json
+    HOME: path.join(DATA_DIR, 'sessions', group.folder),
+  };
+
+  // Prefer pre-built dist, fall back to source via tsx
+  const agentRunnerDist = path.join(groupAgentRunnerDir, '..', 'agent-runner-dist', 'index.js');
+  const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'dist', 'index.js');
+  const runnerPath = fs.existsSync(agentRunnerDist) ? agentRunnerDist : agentRunnerSrc;
+
+  const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
+  const name = `subprocess-${safeName}-${Date.now()}`;
+
+  const proc = spawn('node', [runnerPath], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: groupDir,
+    env: childEnv as Record<string, string>,
+  });
+
+  return { proc, name };
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
@@ -274,43 +410,62 @@ export async function runContainerAgent(
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
+  ensureGroupDirectories(group, input.isMain);
 
-  const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-  const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  let container: ChildProcess;
+  let containerName: string;
 
-  logger.debug(
-    {
-      group: group.name,
-      containerName,
-      mounts: mounts.map(
-        (m) =>
-          `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
-      ),
-      containerArgs: containerArgs.join(' '),
-    },
-    'Container mount configuration',
-  );
+  if (SUBPROCESS_MODE) {
+    const sub = spawnSubprocess(group, input);
+    container = sub.proc;
+    containerName = sub.name;
 
-  logger.info(
-    {
-      group: group.name,
-      containerName,
-      mountCount: mounts.length,
-      isMain: input.isMain,
-    },
-    'Spawning container agent',
-  );
+    logger.info(
+      {
+        group: group.name,
+        containerName,
+        isMain: input.isMain,
+      },
+      'Spawning subprocess agent',
+    );
+  } else {
+    const mounts = buildVolumeMounts(group, input.isMain);
+    containerName = `nanoclaw-${safeName}-${Date.now()}`;
+    const containerArgs = buildContainerArgs(mounts, containerName);
+
+    logger.debug(
+      {
+        group: group.name,
+        containerName,
+        mounts: mounts.map(
+          (m) =>
+            `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
+        ),
+        containerArgs: containerArgs.join(' '),
+      },
+      'Container mount configuration',
+    );
+
+    logger.info(
+      {
+        group: group.name,
+        containerName,
+        mountCount: mounts.length,
+        isMain: input.isMain,
+      },
+      'Spawning container agent',
+    );
+
+    container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  }
 
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
     onProcess(container, containerName);
 
     let stdout = '';
@@ -318,15 +473,15 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    container.stdin.write(JSON.stringify(input));
-    container.stdin.end();
+    container.stdin!.write(JSON.stringify(input));
+    container.stdin!.end();
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
 
-    container.stdout.on('data', (data) => {
+    container.stdout!.on('data', (data) => {
       const chunk = data.toString();
 
       // Always accumulate for logging
@@ -385,7 +540,7 @@ export async function runContainerAgent(
       }
     });
 
-    container.stderr.on('data', (data) => {
+    container.stderr!.on('data', (data) => {
       const chunk = data.toString();
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
@@ -420,15 +575,23 @@ export async function runContainerAgent(
         { group: group.name, containerName },
         'Container timeout, stopping gracefully',
       );
-      exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
-        if (err) {
-          logger.warn(
-            { group: group.name, containerName, err },
-            'Graceful stop failed, force killing',
-          );
-          container.kill('SIGKILL');
-        }
-      });
+      if (SUBPROCESS_MODE) {
+        // Subprocess: send SIGTERM, then SIGKILL after 5s
+        container.kill('SIGTERM');
+        setTimeout(() => {
+          if (!container.killed) container.kill('SIGKILL');
+        }, 5000);
+      } else {
+        exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
+          if (err) {
+            logger.warn(
+              { group: group.name, containerName, err },
+              'Graceful stop failed, force killing',
+            );
+            container.kill('SIGKILL');
+          }
+        });
+      }
     };
 
     let timeout = setTimeout(killOnTimeout, timeoutMs);
@@ -532,16 +695,8 @@ export async function runContainerAgent(
           );
         }
         logLines.push(
-          `=== Container Args ===`,
-          containerArgs.join(' '),
-          ``,
-          `=== Mounts ===`,
-          mounts
-            .map(
-              (m) =>
-                `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
-            )
-            .join('\n'),
+          `=== Mode ===`,
+          SUBPROCESS_MODE ? 'subprocess' : 'container',
           ``,
           `=== Stderr${stderrTruncated ? ' (TRUNCATED)' : ''} ===`,
           stderr,
@@ -554,11 +709,6 @@ export async function runContainerAgent(
           `=== Input Summary ===`,
           `Prompt length: ${input.prompt.length} chars`,
           `Session ID: ${input.sessionId || 'new'}`,
-          ``,
-          `=== Mounts ===`,
-          mounts
-            .map((m) => `${m.containerPath}${m.readonly ? ' (ro)' : ''}`)
-            .join('\n'),
           ``,
         );
       }

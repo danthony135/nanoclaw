@@ -6,6 +6,7 @@ import {
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
+  SUBPROCESS_MODE,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
@@ -492,22 +493,30 @@ function ensureContainerSystemRunning(): void {
 }
 
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
+  if (!SUBPROCESS_MODE) {
+    ensureContainerSystemRunning();
+  } else {
+    logger.info('Running in subprocess mode (no Docker)');
+  }
   initDatabase();
   logger.info('Database initialized');
   loadState();
   restoreRemoteControl();
 
   // Start credential proxy (containers route API calls through this)
-  const proxyServer = await startCredentialProxy(
-    CREDENTIAL_PROXY_PORT,
-    PROXY_BIND_HOST,
-  );
+  // In subprocess mode, child processes access env vars directly — no proxy needed.
+  let proxyServer: import('http').Server | null = null;
+  if (!SUBPROCESS_MODE) {
+    proxyServer = await startCredentialProxy(
+      CREDENTIAL_PROXY_PORT,
+      PROXY_BIND_HOST,
+    );
+  }
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
-    proxyServer.close();
+    proxyServer?.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);

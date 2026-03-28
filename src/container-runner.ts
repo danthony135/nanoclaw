@@ -319,7 +319,12 @@ function ensureGroupDirectories(group: RegisteredGroup, isMain: boolean): void {
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
 
   // Copy agent-runner source for customization
-  const agentRunnerSrc = path.join(process.cwd(), 'container', 'agent-runner', 'src');
+  const agentRunnerSrc = path.join(
+    process.cwd(),
+    'container',
+    'agent-runner',
+    'src',
+  );
   const groupAgentRunnerDir = path.join(
     DATA_DIR,
     'sessions',
@@ -342,8 +347,18 @@ function spawnSubprocess(
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
   const groupIpcDir = resolveGroupIpcPath(group.folder);
-  const groupSessionsDir = path.join(DATA_DIR, 'sessions', group.folder, '.claude');
-  const groupAgentRunnerDir = path.join(DATA_DIR, 'sessions', group.folder, 'agent-runner-src');
+  const groupSessionsDir = path.join(
+    DATA_DIR,
+    'sessions',
+    group.folder,
+    '.claude',
+  );
+  const groupAgentRunnerDir = path.join(
+    DATA_DIR,
+    'sessions',
+    group.folder,
+    'agent-runner-src',
+  );
 
   // Read secrets from .env — subprocess can access them directly
   const secrets = readEnvFile([
@@ -367,9 +382,12 @@ function spawnSubprocess(
     ...process.env,
     TZ: TIMEZONE,
     // Direct API access — no credential proxy
-    ANTHROPIC_API_KEY: secrets.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY,
-    CLAUDE_CODE_OAUTH_TOKEN: secrets.CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_CODE_OAUTH_TOKEN,
-    ANTHROPIC_AUTH_TOKEN: secrets.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN,
+    ANTHROPIC_API_KEY:
+      secrets.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY,
+    CLAUDE_CODE_OAUTH_TOKEN:
+      secrets.CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_CODE_OAUTH_TOKEN,
+    ANTHROPIC_AUTH_TOKEN:
+      secrets.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN,
     // Remove proxy URL if set — subprocess talks to Anthropic directly
     ANTHROPIC_BASE_URL: undefined,
     // Path overrides for the agent-runner
@@ -377,16 +395,30 @@ function spawnSubprocess(
     NANOCLAW_WORKSPACE_IPC: groupIpcDir,
     NANOCLAW_WORKSPACE_GLOBAL: path.join(GROUPS_DIR, 'global'),
     NANOCLAW_WORKSPACE_PROJECT: projectRoot,
-    NANOCLAW_WORKSPACE_EXTRA: extraDirs.length > 0 ? extraDirs.join(path.delimiter) : undefined,
+    NANOCLAW_WORKSPACE_EXTRA:
+      extraDirs.length > 0 ? extraDirs.join(path.delimiter) : undefined,
     NANOCLAW_AGENT_RUNNER_SRC: groupAgentRunnerDir,
     // Point HOME to the sessions dir so the SDK finds .claude/settings.json
     HOME: path.join(DATA_DIR, 'sessions', group.folder),
   };
 
   // Prefer pre-built dist, fall back to source via tsx
-  const agentRunnerDist = path.join(groupAgentRunnerDir, '..', 'agent-runner-dist', 'index.js');
-  const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'dist', 'index.js');
-  const runnerPath = fs.existsSync(agentRunnerDist) ? agentRunnerDist : agentRunnerSrc;
+  const agentRunnerDist = path.join(
+    groupAgentRunnerDir,
+    '..',
+    'agent-runner-dist',
+    'index.js',
+  );
+  const agentRunnerSrc = path.join(
+    projectRoot,
+    'container',
+    'agent-runner',
+    'dist',
+    'index.js',
+  );
+  const runnerPath = fs.existsSync(agentRunnerDist)
+    ? agentRunnerDist
+    : agentRunnerSrc;
 
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const name = `subprocess-${safeName}-${Date.now()}`;
